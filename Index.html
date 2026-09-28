@@ -1,0 +1,1494 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TransShield Engine — Multi-Sheet & Advanced Token Protection Translator</title>
+  
+  <!-- Local compatibility layer: keeps the original UI usable from a local file.
+       No CDN, server, or CORS proxy is required for file import/export. -->
+  <script>
+    /* Minimal local CSV/Papa and XLSX compatibility layer.
+       The original interface uses these small APIs; keeping the API shape intact
+       prevents the UI from changing while removing the fragile CDN dependency. */
+    window.lucide = window.lucide || { createIcons() {} };
+    window.Papa = window.Papa || {
+      parse(text, options = {}) {
+        const delimiter = options.delimiter || (String(text).split(/\r?\n/, 1)[0].includes("\t") ? "\t" : ",");
+        const rows = [];
+        let row = [], cell = "", quoted = false;
+        text = String(text || "").replace(/^\uFEFF/, "");
+        for (let i = 0; i < text.length; i++) {
+          const c = text[i];
+          if (quoted) {
+            if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+            else if (c === '"') quoted = false;
+            else cell += c;
+          } else if (c === '"' && cell === "") quoted = true;
+          else if (c === delimiter) { row.push(cell); cell = ""; }
+          else if (c === "\n" || c === "\r") {
+            if (c === "\r" && text[i + 1] === "\n") i++;
+            row.push(cell);
+            if (row.some(v => v !== "")) rows.push(row);
+            row = []; cell = "";
+          } else cell += c;
+        }
+        if (cell !== "" || row.length) { row.push(cell); if (row.some(v => v !== "")) rows.push(row); }
+        if (!options.header) return { data: rows };
+        const headers = [...new Set((rows.shift() || []).map((h, i) => String(h || `Column_${i + 1}`)))];
+        return { data: rows.map(r => Object.fromEntries(headers.map((h, i) => [h, r[i] ?? ""]))), errors: [] };
+      },
+      unparse(data) {
+        const rows = Array.isArray(data) ? data : [];
+        const headers = [...new Set(rows.flatMap(r => Object.keys(r)))];
+        const q = v => { const s = String(v ?? ""); return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+        return [headers.map(q).join(","), ...rows.map(r => headers.map(h => q(r[h])).join(","))].join("\r\n");
+      }
+    };
+    (() => {
+      const te = new TextEncoder(), td = new TextDecoder();
+      const u16 = n => new Uint8Array([n & 255, n >>> 8 & 255]);
+      const u32 = n => new Uint8Array([n & 255, n >>> 8 & 255, n >>> 16 & 255, n >>> 24 & 255]);
+      const join = parts => { const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0)); let o = 0; parts.forEach(p => { out.set(p, o); o += p.length; }); return out; };
+      const escXml = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" }[c]));
+      const crc32 = data => { let c = 0xffffffff; for (const b of data) { c ^= b; for (let k = 0; k < 8; k++) c = (c >>> 1) ^ ((c & 1) ? 0xedb88320 : 0); } return (c ^ 0xffffffff) >>> 0; };
+      const colName = n => { let s = ""; do { s = String.fromCharCode(65 + n % 26) + s; n = Math.floor(n / 26) - 1; } while (n >= 0); return s; };
+      const colIndex = ref => { let n = 0; for (const c of (ref.match(/[A-Z]+/i) || ["A"])[0]) n = n * 26 + c.toUpperCase().charCodeAt(0) - 64; return n - 1; };
+      const matrixRows = matrix => {
+        if (!matrix.length) return [];
+        const headers = [...new Set(matrix[0].map((h, i) => String(h ?? "").trim() || `Column_${i + 1}`))];
+        return matrix.slice(1).filter(r => r.some(v => String(v ?? "") !== "")).map(r => Object.fromEntries(headers.map((h, i) => [h, String(r[i] ?? "")])));
+      };
+      const sheetFromRows = rows => ({ __rows: rows || [] });
+      const zipStore = entries => {
+        const local = [], central = []; let offset = 0;
+        entries.forEach(([name, text]) => {
+          const nb = te.encode(name), db = te.encode(text), crc = crc32(db);
+          const head = join([u32(0x04034b50), u16(20), u16(0), u16(0), u16(0), u16(0), u32(crc), u32(db.length), u32(db.length), u16(nb.length), u16(0), nb, db]);
+          local.push(head);
+          central.push(join([u32(0x02014b50), u16(20), u16(20), u16(0), u16(0), u16(0), u16(0), u32(crc), u32(db.length), u32(db.length), u16(nb.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(offset), nb]));
+          offset += head.length;
+        });
+        const body = join(local), cd = join(central);
+        return join([body, cd, u32(0x06054b50), u16(0), u16(0), u16(entries.length), u16(entries.length), u32(cd.length), u32(body.length), u16(0)]);
+      };
+      const makeXlsx = workbook => {
+        const names = workbook.SheetNames, overrides = names.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("");
+        const sheetRefs = names.map((n, i) => `<sheet name="${escXml(n.slice(0, 31))}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join("");
+        const rels = names.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join("");
+        const sheetXml = rows => {
+          const headers = [...new Set(rows.flatMap(r => Object.keys(r)))];
+          const cells = (r, rowNo) => headers.map((h, i) => `<c r="${colName(i)}${rowNo}" t="inlineStr"><is><t xml:space="preserve">${escXml(r[h] ?? "")}</t></is></c>`).join("");
+          return `<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1">${cells(Object.fromEntries(headers.map(h => [h, h])), 1)}</row>${rows.map((r, i) => `<row r="${i + 2}">${cells(r, i + 2)}</row>`).join("")}</sheetData></worksheet>`;
+        };
+        const entries = [
+          ["[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>${overrides}</Types>`],
+          ["_rels/.rels", `<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`],
+          ["xl/workbook.xml", `<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${sheetRefs}</sheets></workbook>`],
+          ["xl/_rels/workbook.xml.rels", `<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${rels}</Relationships>`],
+          ...names.map((n, i) => [`xl/worksheets/sheet${i + 1}.xml`, sheetXml(workbook.Sheets[n].__rows || [])])
+        ];
+        return zipStore(entries);
+      };
+      const parseZip = async data => {
+        const view = new DataView(data.buffer, data.byteOffset, data.byteLength); let eocd = -1;
+        for (let i = data.length - 22; i >= 0 && i > data.length - 65558; i--) if (view.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+        if (eocd < 0) throw Error("This is not a valid XLSX file.");
+        const count = view.getUint16(eocd + 10, true), dir = view.getUint32(eocd + 16, true), files = {}; let p = dir;
+        for (let n = 0; n < count; n++) {
+          if (view.getUint32(p, true) !== 0x02014b50) break;
+          const method = view.getUint16(p + 10, true), size = view.getUint32(p + 24, true), compressed = view.getUint32(p + 20, true), nameLen = view.getUint16(p + 28, true), extraLen = view.getUint16(p + 30, true), commentLen = view.getUint16(p + 32, true), offset = view.getUint32(p + 42, true), name = td.decode(data.slice(p + 46, p + 46 + nameLen));
+          const lv = new DataView(data.buffer, data.byteOffset + offset, data.byteLength - offset), ln = lv.getUint16(26, true), le = lv.getUint16(28, true), raw = data.slice(offset + 30 + ln + le, offset + 30 + ln + le + compressed);
+          let content = raw;
+          if (method === 8) {
+            if (typeof DecompressionStream === "undefined") throw Error("This browser cannot open compressed XLSX files. Export CSV or JSON instead.");
+            content = new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(new DecompressionStream("deflate-raw"))).arrayBuffer());
+          } else if (method !== 0) throw Error("Unsupported XLSX compression method.");
+          files[name] = content.slice(0, size); p += 46 + nameLen + extraLen + commentLen;
+        }
+        return files;
+      };
+      const xml = (files, name) => files[name] ? new DOMParser().parseFromString(td.decode(files[name]), "application/xml") : null;
+      const readXlsx = async buffer => {
+        const files = await parseZip(new Uint8Array(buffer)), wb = xml(files, "xl/workbook.xml"), rel = xml(files, "xl/_rels/workbook.xml.rels"), shared = xml(files, "xl/sharedStrings.xml");
+        if (!wb) throw Error("The XLSX workbook is missing workbook.xml.");
+        const strings = shared ? [...shared.querySelectorAll("si")].map(si => [...si.querySelectorAll("t")].map(t => t.textContent).join("")) : [], relMap = {};
+        rel?.querySelectorAll("Relationship").forEach(r => relMap[r.getAttribute("Id")] = r.getAttribute("Target"));
+        const output = {};
+        for (const sn of wb.querySelectorAll("sheet")) {
+          const name = sn.getAttribute("name") || "Sheet", rid = sn.getAttribute("r:id"), rawTarget = relMap[rid] || "", target = rawTarget.startsWith("xl/") ? rawTarget : `xl/${rawTarget.replace(/^\/?/, "")}`, doc = xml(files, target), matrix = [];
+          doc?.querySelectorAll("sheetData > row").forEach(row => { const cells = []; [...row.children].filter(c => c.localName === "c").forEach(c => { const i = colIndex(c.getAttribute("r") || "A1"), type = c.getAttribute("t"), v = c.querySelector("v")?.textContent ?? c.querySelector("is")?.textContent ?? ""; cells[i] = type === "s" ? (strings[Number(v)] ?? "") : v; }); matrix.push(cells); });
+          output[name] = sheetFromRows(matrixRows(matrix));
+        }
+        return { SheetNames: Object.keys(output), Sheets: output };
+      };
+      window.XLSX = window.XLSX || {
+        read: readXlsx,
+        utils: {
+          book_new: () => ({ SheetNames: [], Sheets: {} }),
+          book_append_sheet: (wb, ws, name) => { wb.SheetNames.push(name); wb.Sheets[name] = ws; },
+          json_to_sheet: rows => sheetFromRows(rows),
+          sheet_to_json: sheet => sheet?.__rows || []
+        },
+        writeFile: (wb, name) => { const blob = new Blob([makeXlsx(wb)], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); }
+      };
+    })();
+  </script>
+  
+  <!-- Embedded Fallback & Component Styles -->
+  <style>
+    :root {
+      --bg: #0b1120;
+      --card: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --primary: #4f46e5;
+    }
+    body {
+      background-color: #060913;
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    .table-container {
+      max-height: 480px;
+      overflow: auto;
+    }
+    th, td {
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    input, select, textarea {
+      background-color: #0f172a !important;
+      color: #f8fafc !important;
+      border-color: #334155 !important;
+    }
+    input:focus, select:focus, textarea:focus {
+      outline: none;
+      border-color: #6366f1 !important;
+      box-shadow: 0 0 0 1px #6366f1;
+    }
+    .token-badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 0.1rem 0.35rem;
+      margin: 0 0.1rem;
+      border-radius: 0.25rem;
+      font-size: 0.72rem;
+      font-family: monospace;
+      font-weight: 600;
+      line-height: 1.2;
+    }
+    .token-badge.math { background: rgba(234, 179, 8, 0.15); color: #fde047; border: 1px solid rgba(234, 179, 8, 0.35); }
+    .token-badge.tag { background: rgba(59, 130, 246, 0.15); color: #93c5fd; border: 1px solid rgba(59, 130, 246, 0.35); }
+    .token-badge.var { background: rgba(236, 72, 153, 0.15); color: #f472b6; border: 1px solid rgba(236, 72, 153, 0.35); }
+    .token-badge.printf { background: rgba(14, 165, 233, 0.15); color: #38bdf8; border: 1px solid rgba(14, 165, 233, 0.35); }
+    .token-badge.bracket { background: rgba(249, 115, 22, 0.15); color: #fb923c; border: 1px solid rgba(249, 115, 22, 0.35); }
+    .token-badge.emoji { background: rgba(168, 85, 247, 0.15); color: #d8b4fe; border: 1px solid rgba(168, 85, 247, 0.35); }
+    .token-badge.glossary { background: rgba(16, 185, 129, 0.15); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.35); }
+    .sheet-card-active { border-color: #6366f1 !important; background: rgba(15, 23, 42, 0.95); }
+    .sheet-card-skipped { border-color: #334155; opacity: 0.6; }
+  </style>
+</head>
+
+<body class="min-h-screen p-4 md:p-8 flex flex-col selection:bg-indigo-500 selection:text-white">
+  <div class="max-w-7xl mx-auto w-full space-y-6 flex-1">
+    
+    <!-- Top Header -->
+    <header class="flex flex-col md:flex-row md:items-center justify-between pb-6 border-b border-slate-800 gap-4">
+      <div>
+        <h1 class="text-3xl font-extrabold tracking-tight text-white flex items-center gap-3">
+          <span class="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-600 to-emerald-400 flex items-center justify-center shadow-lg shadow-indigo-600/30 text-white text-xl">🛡️</span>
+          <span>TransShield Engine</span>
+          <span class="text-xs bg-indigo-600 text-white font-semibold px-2.5 py-0.5 rounded-full uppercase tracking-wider">v5.0 Shield Pro</span>
+        </h1>
+        <p class="text-slate-400 text-xs md:text-sm mt-1">
+          Bulletproof Tokenizer for Code, Printf Specifiers, {{Mustache}}, [Brackets], Math, Tags &amp; Emojis across multi-sheet spreadsheets.
+        </p>
+      </div>
+      <div class="flex items-center gap-2">
+        <button id="btn-open-lab" class="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-lg border border-slate-700 transition flex items-center gap-1.5 shadow-sm">
+          <i data-lucide="binary" class="w-3.5 h-3.5 text-indigo-400"></i>
+          <span>Tokenizer Lab</span>
+        </button>
+        <button id="btn-load-demo" class="px-4 py-2 bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white text-xs font-semibold rounded-lg shadow-md shadow-indigo-600/25 transition flex items-center gap-1.5">
+          <i data-lucide="layers" class="w-3.5 h-3.5"></i>
+          <span>Load Multi-Sheet Demo</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Global Alert / Toast Banner -->
+    <div id="alert-banner" class="hidden rounded-xl p-4 border flex items-start gap-3 shadow-xl">
+      <div id="alert-icon" class="text-xl">⚠️</div>
+      <div class="flex-1">
+        <h4 id="alert-title" class="font-bold text-sm"></h4>
+        <div id="alert-msg" class="text-xs mt-1 text-slate-300 space-y-1.5"></div>
+      </div>
+      <button onclick="hideAlert()" class="text-slate-400 hover:text-white text-sm font-bold p-1">✕</button>
+    </div>
+
+    <!-- Main Workspace Grid -->
+    <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+      
+      <!-- Left Column: Ingestion & Per-Sheet Column Matrix (7 cols) -->
+      <section class="lg:col-span-7 space-y-6">
+        
+        <!-- Step 1: File Ingestion -->
+        <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
+          <div class="flex items-center justify-between">
+            <h2 class="text-base font-semibold text-white flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-indigo-600 text-white text-xs flex items-center justify-center font-bold">1</span>
+              File Ingestion &amp; Workbook Loader
+            </h2>
+            <span id="file-status" class="text-xs text-slate-400 font-medium font-mono">No file loaded</span>
+          </div>
+
+          <!-- Drag and Drop Area -->
+          <div id="drop-zone" class="border-2 border-dashed border-slate-700 hover:border-indigo-500 rounded-xl p-6 text-center cursor-pointer transition bg-slate-950/40">
+            <input type="file" id="file-input" class="hidden" accept=".xlsx,.csv,.tsv,.txt,.json">
+            <div class="text-3xl mb-2">📊</div>
+            <p class="text-sm font-medium text-slate-200">Click to upload or drag &amp; drop</p>
+              <p class="text-xs text-slate-400 mt-1">Excel (.xlsx), CSV/TSV, JSON, or Plain Text (.txt)</p>
+          </div>
+
+          <!-- Google Sheets Link Converter -->
+          <div class="space-y-2 pt-2 border-t border-slate-800">
+            <label class="block text-xs font-semibold text-slate-300">Google Sheets Link (Drive App, Edit, or Share links)</label>
+            <div class="flex items-center gap-2">
+              <input type="text" id="gsheet-url" placeholder="Paste link (e.g. https://docs.google.com/spreadsheets/d/.../edit?usp=drivesdk)" class="flex-1 px-3 py-2 text-xs rounded-lg border font-mono">
+              <button id="btn-fetch-gsheet" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold rounded-lg text-white transition flex items-center gap-1.5 whitespace-nowrap shadow-sm">
+                <i data-lucide="zap" class="w-3.5 h-3.5"></i>
+                <span>Convert &amp; Fetch</span>
+              </button>
+            </div>
+
+            <!-- Dynamic Link Converter Box -->
+            <div id="gsheet-converter-box" class="hidden bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs space-y-2">
+              <div class="flex items-center justify-between">
+                <span class="font-semibold text-indigo-300">🔗 Detected Sheet ID: <code id="detected-sheet-id" class="text-white"></code></span>
+                <span class="px-2 py-0.5 rounded text-[10px] bg-slate-800 text-slate-300 font-mono">Ready</span>
+              </div>
+              <div class="flex flex-wrap gap-2 pt-1">
+                <a id="btn-direct-download-xlsx" href="#" target="_blank" class="px-3 py-1.5 bg-emerald-800 hover:bg-emerald-700 text-white rounded font-medium text-[11px] flex items-center gap-1 shadow-sm">
+                  <i data-lucide="download" class="w-3.5 h-3.5"></i>
+                  <span>Direct Download All Sheets (.xlsx)</span>
+                </a>
+              </div>
+              <p class="text-[11px] text-slate-400">
+                If the sheet is set to private in Google Drive, click <em>Direct Download All Sheets</em> to save it via your browser session, then drop the file above!
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Step 2: Per-Sheet Independent Column Selection Matrix -->
+        <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
+          <div class="flex flex-col md:flex-row md:items-center justify-between gap-2 pb-2 border-b border-slate-800">
+            <div>
+              <h2 class="text-base font-semibold text-white flex items-center gap-2">
+                <span class="w-6 h-6 rounded-full bg-indigo-600 text-white text-xs flex items-center justify-center font-bold">2</span>
+                Per-Sheet Column Selection Matrix
+              </h2>
+              <p class="text-xs text-slate-400 mt-0.5">Choose different columns for different sheets, or skip specific sheets.</p>
+            </div>
+            <div class="flex items-center gap-1.5 text-[11px]">
+              <button id="btn-quick-sync-same" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 rounded text-slate-200 border border-slate-700 transition" title="Match the active column across other sheets that contain it">
+                🔄 Sync by Name
+              </button>
+              <button id="btn-quick-first-col" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 rounded text-slate-200 border border-slate-700 transition" title="Select first column of each sheet">
+                📑 All 1st Col
+              </button>
+              <button id="btn-quick-skip-all" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 rounded text-slate-200 border border-slate-700 transition" title="Skip all sheets">
+                ⊘ Skip All
+              </button>
+            </div>
+          </div>
+
+          <!-- Sheet Matrix Cards Container -->
+          <div id="sheet-matrix" class="space-y-3 pt-1">
+            <div class="bg-slate-950 border border-slate-800 rounded-xl p-6 text-center text-xs text-slate-500">
+              No workbook loaded. Upload a spreadsheet or click <em>Load Multi-Sheet Demo</em> above.
+            </div>
+          </div>
+
+          <!-- Target Languages & Protected Terms -->
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4 pt-3 border-t border-slate-800">
+            <div>
+              <label class="block text-xs font-semibold text-slate-300 mb-1">Target Languages</label>
+              <input type="text" id="target-langs" value="FR, ES, DE, HI, GU, JA" class="w-full px-3 py-2 text-xs rounded-lg border font-mono">
+              <p class="text-[10px] text-slate-400 mt-1">Accepts codes or names (e.g. French, Spanish, HI, GU, JA).</p>
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-300 mb-1">Protected Terms (Never Altered)</label>
+              <input type="text" id="protected-glossary" value="PAC, POD, MSNF, Brix, API, HTML, CSS, DevOps" class="w-full px-3 py-2 text-xs rounded-lg border font-mono">
+              <p class="text-[10px] text-slate-400 mt-1">Comma-separated domain terminology, brand names &amp; acronyms.</p>
+            </div>
+          </div>
+        </div>
+
+      </section>
+
+      <!-- Right Column: Provider & Translation Engine (5 cols) -->
+      <section class="lg:col-span-5 space-y-6">
+        
+        <!-- Step 3: Provider Setup -->
+        <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
+          <h2 class="text-base font-semibold text-white flex items-center gap-2">
+            <span class="w-6 h-6 rounded-full bg-indigo-600 text-white text-xs flex items-center justify-center font-bold">3</span>
+            Translation Provider
+          </h2>
+
+          <div>
+            <label class="block text-xs font-semibold text-slate-300 mb-1">Service Engine</label>
+            <select id="provider-select" class="w-full px-3 py-2 text-xs rounded-lg border font-medium">
+              <option value="free_google" selected>🌐 Free Web Google Translate (No API Key Required)</option>
+              <option value="google_cloud">🔑 Google Cloud Translation API v2 (Requires API Key)</option>
+              <option value="azure">🔑 Microsoft Azure Translator v3 (Key + Region)</option>
+              <option value="mock">🧪 Offline Simulator (Instant Token Verification)</option>
+            </select>
+          </div>
+
+          <div id="cfg-google-cloud" class="hidden space-y-2">
+            <label class="block text-xs font-semibold text-slate-300">Google Cloud API Key</label>
+            <input type="password" id="google-api-key" placeholder="AIzaSy..." class="w-full px-3 py-2 text-xs rounded-lg border font-mono">
+          </div>
+
+          <div id="cfg-azure" class="hidden space-y-2">
+            <div class="grid grid-cols-2 gap-2">
+              <div>
+                <label class="block text-xs font-semibold text-slate-300 mb-1">Azure Key</label>
+                <input type="password" id="azure-key" placeholder="Key" class="w-full px-3 py-2 text-xs rounded-lg border font-mono">
+              </div>
+              <div>
+                <label class="block text-xs font-semibold text-slate-300 mb-1">Region</label>
+                <input type="text" id="azure-region" value="global" class="w-full px-3 py-2 text-xs rounded-lg border font-mono">
+              </div>
+            </div>
+          </div>
+
+          <!-- Token Shield Specs Card -->
+          <div class="bg-slate-950 border border-indigo-900/40 rounded-xl p-3.5 text-[11px] text-slate-300 space-y-1.5 shadow-inner">
+            <div class="flex items-center gap-1.5 text-indigo-400 font-bold uppercase tracking-wider text-[10px]">
+              <i data-lucide="shield-check" class="w-3.5 h-3.5"></i>
+              <span>Active Shield Protection Rules</span>
+            </div>
+            <div class="grid grid-cols-2 gap-x-2 gap-y-1 text-[10px] text-slate-400 font-mono">
+              <div>✔ HTML/XML (<span class="text-blue-400">&lt;tags&gt;</span>)</div>
+              <div>✔ LaTeX Math (<span class="text-yellow-400">$...$</span>)</div>
+              <div>✔ Double Braces (<span class="text-pink-400">{{var}}</span>)</div>
+              <div>✔ Single Braces (<span class="text-pink-400">{var}</span>)</div>
+              <div>✔ Printf (<span class="text-cyan-400">%s, %.2f</span>)</div>
+              <div>✔ Tokens (<span class="text-orange-400">[CODE]</span>)</div>
+              <div>✔ Emojis (<span class="text-purple-400">👨‍💻, 🚀</span>)</div>
+              <div>✔ Glossaries (<span class="text-emerald-400">Brix, PAC</span>)</div>
+            </div>
+            <p class="text-[10px] text-slate-500 pt-1 border-t border-slate-800">
+              * Natural percentages like <em>"20% discount"</em> are kept as prose and safely translated.
+            </p>
+          </div>
+        </div>
+
+        <!-- Step 4: Run Translation -->
+        <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
+          <h2 class="text-base font-semibold text-white flex items-center gap-2">
+            <span class="w-6 h-6 rounded-full bg-indigo-600 text-white text-xs flex items-center justify-center font-bold">4</span>
+            Run Engine
+          </h2>
+
+          <!-- Translation Plan Summary Box -->
+          <div id="plan-summary-box" class="bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs space-y-1">
+            <div class="font-semibold text-slate-300 flex items-center justify-between">
+              <span>📋 Active Translation Plan:</span>
+              <span id="plan-active-sheet-count" class="text-indigo-400 font-mono">0 sheets</span>
+            </div>
+            <div id="plan-details" class="text-[11px] text-slate-400 space-y-0.5">
+              <span>No sheets configured for translation.</span>
+            </div>
+          </div>
+
+          <div class="flex gap-2">
+            <button id="btn-start" class="flex-1 py-3 bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 font-bold text-white text-sm rounded-xl shadow-lg shadow-indigo-600/30 transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2">
+              <i data-lucide="play" class="w-4 h-4 fill-white"></i>
+              <span>Start Translation</span>
+            </button>
+            <button id="btn-cancel" class="px-4 py-3 bg-rose-900/80 hover:bg-rose-800 font-bold text-white text-xs rounded-xl hidden transition flex items-center gap-1.5">
+              <i data-lucide="square" class="w-3.5 h-3.5"></i>
+              <span>Stop</span>
+            </button>
+          </div>
+
+          <!-- Progress Info -->
+          <div id="progress-container" class="hidden space-y-2 pt-2">
+            <div class="flex justify-between text-xs font-medium">
+              <span id="progress-status" class="text-slate-300">Translating...</span>
+              <span id="progress-pct" class="text-indigo-400 font-mono">0%</span>
+            </div>
+            <div class="w-full bg-slate-950 rounded-full h-2.5 overflow-hidden border border-slate-800">
+              <div id="progress-bar" class="bg-gradient-to-r from-indigo-500 to-emerald-400 h-2.5 rounded-full transition-all duration-300 w-0"></div>
+            </div>
+          </div>
+        </div>
+
+      </section>
+    </div>
+
+    <!-- Live Preview Table & Sheet Tabs -->
+    <section class="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
+      <div class="flex flex-col md:flex-row md:items-center justify-between gap-3">
+        <div>
+          <h3 class="text-base font-bold text-white flex items-center gap-2">
+            <span>📊 Live Data Preview</span>
+            <span id="preview-row-count" class="text-xs font-normal text-slate-400 font-mono">(0 rows)</span>
+          </h3>
+          <p class="text-xs text-slate-400">Switch tabs below to inspect translations across worksheets in real time.</p>
+        </div>
+
+        <!-- Export Buttons -->
+        <div class="flex items-center gap-2">
+          <button id="btn-export-xlsx" disabled class="px-3.5 py-2 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold text-xs rounded-lg transition flex items-center gap-1.5 shadow-sm">
+            <i data-lucide="file-spreadsheet" class="w-4 h-4"></i>
+            <span>Download Excel (.xlsx)</span>
+          </button>
+          <button id="btn-export-csv" disabled class="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold text-xs rounded-lg transition flex items-center gap-1.5 border border-slate-700">
+            <i data-lucide="file-text" class="w-4 h-4"></i>
+            <span>Download CSV (UTF-8 BOM)</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Sheet Tabs -->
+      <div id="preview-sheet-tabs" class="flex flex-wrap gap-1.5 border-b border-slate-800 pb-2">
+        <span class="text-xs text-slate-500 py-1 font-mono">No workbook loaded</span>
+      </div>
+
+      <!-- Table View -->
+      <div class="table-container rounded-xl border border-slate-800 bg-slate-950">
+        <table id="preview-table" class="w-full text-left text-xs border-collapse">
+          <thead class="bg-slate-900/90 sticky top-0 border-b border-slate-800 text-slate-300">
+            <tr>
+              <th class="p-3 w-12 text-center">#</th>
+              <th class="p-3">Column Data</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-800/60 text-slate-300 font-mono">
+            <tr>
+              <td colspan="2" class="p-6 text-center text-slate-500 font-sans">No data loaded yet.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- Tokenizer Lab / Playground Modal -->
+  <div id="labModal" class="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm hidden items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-3xl w-full p-6 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+        <div class="flex items-center space-x-2">
+          <div class="w-8 h-8 rounded-lg bg-indigo-500/20 text-indigo-400 flex items-center justify-center">
+            <i data-lucide="binary" class="w-4 h-4"></i>
+          </div>
+          <h3 class="text-base font-semibold text-white">Tokenizer Lab &amp; Safeguard Playground</h3>
+        </div>
+        <button id="btn-close-lab" class="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition">
+          <i data-lucide="x" class="w-5 h-5"></i>
+        </button>
+      </div>
+
+      <p class="text-xs text-slate-400">Test how the upgraded shield deterministically masks {{mustache}}, %s printf specifiers, [TOKENS], formulas, tags, emojis, and glossaries without breaking natural percentages like "20% off".</p>
+
+      <div>
+        <label class="block text-xs font-semibold text-slate-300 mb-1">Enter Raw Test String:</label>
+        <textarea id="lab-input" rows="3" class="w-full bg-slate-950 font-mono text-xs rounded-lg p-3 border border-slate-700 text-slate-200 focus:outline-none focus:border-indigo-500 transition">Save 20% on {{product_name}}! Contact %s or [USER_REF_42] for %.2f%% boost. Formula: $E = mc^2$. Gelato: Brix 18°, PAC 240, POD 160. 🍨 👨‍💻</textarea>
+      </div>
+
+      <div class="flex justify-end">
+        <button id="btn-run-lab" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold flex items-center space-x-1.5 transition">
+          <i data-lucide="play" class="w-3.5 h-3.5 fill-white"></i>
+          <span>Execute Tokenization Cycle</span>
+        </button>
+      </div>
+
+      <div class="space-y-3 pt-2">
+        <div>
+          <label class="block text-[11px] font-semibold uppercase tracking-wider text-indigo-400 mb-1">1. Masked String (Sent to Translation API):</label>
+          <div id="lab-masked-output" class="p-3 bg-slate-950 border border-slate-800 rounded-lg text-xs font-mono text-slate-200 break-words"></div>
+        </div>
+
+        <div>
+          <label class="block text-[11px] font-semibold uppercase tracking-wider text-emerald-400 mb-1">2. Discovered Protected Tokens:</label>
+          <div id="lab-tokens-table" class="p-3 bg-slate-950 border border-slate-800 rounded-lg max-h-40 overflow-y-auto"></div>
+        </div>
+
+        <div>
+          <label class="block text-[11px] font-semibold uppercase tracking-wider text-cyan-400 mb-1">3. Simulated De-tokenized Restoration:</label>
+          <div id="lab-restored-output" class="p-3 bg-slate-950 border border-slate-800 rounded-lg text-xs font-mono text-slate-200 break-words"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    /* =========================================================================
+     * GLOBAL STATE STORE
+     * ========================================================================= */
+    const state = {
+      workbook: null,
+      sheetsData: {},       // { [sheetName]: Array<Object> }
+      sheetColumnMap: {},   // { [sheetName]: selectedColumnName | null }
+      activeSheet: null,    // Sheet currently visible in preview
+      isCancelled: false,
+      isRunning: false
+    };
+
+    const LANG_MAP = {
+      'french': 'fr', 'german': 'de', 'spanish': 'es', 'italian': 'it',
+      'hindi': 'hi', 'gujarati': 'gu', 'marathi': 'mr', 'bengali': 'bn',
+      'tamil': 'ta', 'telugu': 'te', 'japanese': 'ja', 'chinese': 'zh-CN',
+      'arabic': 'ar', 'russian': 'ru', 'portuguese': 'pt', 'dutch': 'nl'
+    };
+
+    function cleanLangCode(input) {
+      const trimmed = input.trim().toLowerCase();
+      return LANG_MAP[trimmed] || trimmed;
+    }
+
+    /* =========================================================================
+     * 1. BULLETPROOF ADVANCED TOKENIZER & PROTECTION SHIELD
+     * ========================================================================= */
+    class TokenizerEngine {
+      /**
+       * Masks sensitive patterns into XML-safe tags: <PH_0>, <PH_1>, etc.
+       * Uses non-destructive offset scanning to prevent token cascade corruption.
+       */
+      static mask(text, glossaryTerms = []) {
+        if (!text || typeof text !== 'string') return { maskedText: text || '', tokens: [] };
+
+        const matches = [];
+
+        // 1. Math block & inline LaTeX: $$...$$ and $...$
+        const mathDisplayRegex = /\$\$[\s\S]*?\$\$/g;
+        let m;
+        while ((m = mathDisplayRegex.exec(text)) !== null) {
+          matches.push({ start: m.index, end: m.index + m[0].length, val: m[0], type: 'math' });
+        }
+        const mathInlineRegex = /\$(?!\$)[^\$\n\r]+?\$/g;
+        while ((m = mathInlineRegex.exec(text)) !== null) {
+          matches.push({ start: m.index, end: m.index + m[0].length, val: m[0], type: 'math' });
+        }
+
+        // 2. HTML & XML Tags verbatim: <...>, <a href="...">, <br/>, <code>
+        const htmlRegex = /<\/?[a-zA-Z][^>]*>/gi;
+        while ((m = htmlRegex.exec(text)) !== null) {
+          matches.push({ start: m.index, end: m.index + m[0].length, val: m[0], type: 'tag' });
+        }
+
+        // 3. Double and Single Curly Braces: {{mustache}} and {template_var}
+        const doubleCurlyRegex = /\{\{[^{}\n\r\t]+?\}\}/g;
+        while ((m = doubleCurlyRegex.exec(text)) !== null) {
+          matches.push({ start: m.index, end: m.index + m[0].length, val: m[0], type: 'var' });
+        }
+        const singleCurlyRegex = /\{[^{}\n\r\t]+?\}/g;
+        while ((m = singleCurlyRegex.exec(text)) !== null) {
+          matches.push({ start: m.index, end: m.index + m[0].length, val: m[0], type: 'var' });
+        }
+
+        // 4. C-style Printf Specifiers: %s, %d, %1$s, %.2f, %+10d, %-5s
+        // Must NOT match natural percentages like "20% discount" or "50% off"
+        const printfRegex = /(?<!%)%(?:\d+\$)?[+-]?(?:0)?\d*(?:\.\d+)?[diufFeEgGxXoscpn](?![a-zA-Z0-9_])/g;
+        while ((m = printfRegex.exec(text)) !== null) {
+          matches.push({ start: m.index, end: m.index + m[0].length, val: m[0], type: 'printf' });
+        }
+
+        // 5. Square Bracket Tokens: [TOKEN_NAME], [USER_ID], [0]
+        const bracketTokenRegex = /\[[A-Za-z0-9_-]{2,}\]|\[\d+\]/g;
+        while ((m = bracketTokenRegex.exec(text)) !== null) {
+          matches.push({ start: m.index, end: m.index + m[0].length, val: m[0], type: 'bracket' });
+        }
+
+        // 6. Unicode Compound Emojis & Extended Pictographs (with Zero-Width Joiner ZWJ support)
+        try {
+          const emojiRegex = /(?:\p{Extended_Pictographic}(?:\uFE0F|\uD83C[\uDFFB-\uDFFF])?(?:\u200D\p{Extended_Pictographic}(?:\uFE0F|\uD83C[\uDFFB-\uDFFF])?)*)/gu;
+          while ((m = emojiRegex.exec(text)) !== null) {
+            matches.push({ start: m.index, end: m.index + m[0].length, val: m[0], type: 'emoji' });
+          }
+        } catch (e) {
+          const fallbackEmoji = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu;
+          while ((m = fallbackEmoji.exec(text)) !== null) {
+            matches.push({ start: m.index, end: m.index + m[0].length, val: m[0], type: 'emoji' });
+          }
+        }
+
+        // 7. Case-Sensitive Technical Glossary Terms (sorted by length descending)
+        if (glossaryTerms && glossaryTerms.length > 0) {
+          const sortedTerms = [...glossaryTerms]
+            .map(t => t.trim())
+            .filter(t => t.length > 0)
+            .sort((a, b) => b.length - a.length);
+
+          sortedTerms.forEach(term => {
+            const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const termRegex = new RegExp(`\\b${escaped}\\b`, 'g');
+            while ((m = termRegex.exec(text)) !== null) {
+              matches.push({ start: m.index, end: m.index + m[0].length, val: m[0], type: 'glossary' });
+            }
+          });
+        }
+
+        // Sort matches by start ascending, length descending
+        matches.sort((a, b) => {
+          if (a.start !== b.start) return a.start - b.start;
+          return (b.end - b.start) - (a.end - a.start);
+        });
+
+        // Filter overlapping collisions
+        const nonOverlapping = [];
+        let lastEnd = -1;
+        for (const item of matches) {
+          if (item.start >= lastEnd) {
+            nonOverlapping.push(item);
+            lastEnd = item.end;
+          }
+        }
+
+        // Build masked string and token store from left to right
+        const tokens = [];
+        let maskedText = '';
+        let currentIndex = 0;
+
+        nonOverlapping.forEach((item, idx) => {
+          maskedText += text.slice(currentIndex, item.start);
+          const placeholder = `<PH_${idx}>`;
+          tokens.push({
+            id: idx,
+            placeholder: placeholder,
+            original: item.val,
+            type: item.type
+          });
+          maskedText += placeholder;
+          currentIndex = item.end;
+        });
+        maskedText += text.slice(currentIndex);
+
+        return { maskedText, tokens };
+      }
+
+      /**
+       * De-tokenizes translated string, restoring all protected tokens verbatim.
+       * Handles case variations, HTML entity encodings, bracket changes, and extra whitespace.
+       */
+      static unmask(translatedText, tokens) {
+        if (!translatedText || !tokens || tokens.length === 0) return translatedText || '';
+
+        // Universal resilient regex handling variations:
+        // <PH_0>, <ph_0>, &lt;PH_0&gt;, &lt;ph_0&gt;, [PH_0], (PH_0), {PH_0}, < PH_0 >, \bPH_0\b
+        const deTokenizeRegex = /(?:<|&lt;)\s*(?:PH|ph)_(\d+)\s*(?:>|&gt;)|\[\s*(?:PH|ph)_(\d+)\s*\]|\(\s*(?:PH|ph)_(\d+)\s*\)|\{\s*(?:PH|ph)_(\d+)\s*\}|\b(?:PH|ph)_(\d+)\b/gi;
+
+        return translatedText.replace(deTokenizeRegex, (match, g1, g2, g3, g4, g5) => {
+          const rawIndex = g1 !== undefined ? g1 : (g2 !== undefined ? g2 : (g3 !== undefined ? g3 : (g4 !== undefined ? g4 : g5)));
+          const idx = parseInt(rawIndex, 10);
+          if (!isNaN(idx) && tokens[idx] !== undefined) {
+            return tokens[idx].original;
+          }
+          return match;
+        });
+      }
+    }
+
+    /* =========================================================================
+     * 2. GOOGLE SHEETS LINK CONVERTER & WORKBOOK INGESTOR
+     * ========================================================================= */
+    function parseGoogleSheetUrl(url) {
+      if (!url) return null;
+      const cleanUrl = url.trim();
+      const idMatch = cleanUrl.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+      if (!idMatch) return null;
+
+      const sheetId = idMatch[1];
+      const gidMatch = cleanUrl.match(/[#&?]gid=([0-9]+)/);
+      const gid = gidMatch ? gidMatch[1] : null;
+
+      return {
+        sheetId,
+        gid,
+        xlsxExportUrl: `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=xlsx`,
+        csvExportUrl: `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv${gid ? `&gid=${gid}` : ''}`
+      };
+    }
+
+    document.getElementById('gsheet-url').addEventListener('input', (e) => {
+      const parsed = parseGoogleSheetUrl(e.target.value);
+      const box = document.getElementById('gsheet-converter-box');
+      if (parsed) {
+        box.classList.remove('hidden');
+        document.getElementById('detected-sheet-id').textContent = parsed.sheetId;
+        document.getElementById('btn-direct-download-xlsx').href = parsed.xlsxExportUrl;
+      } else {
+        box.classList.add('hidden');
+      }
+    });
+
+    async function fetchGoogleWorkbook(url) {
+      const parsed = parseGoogleSheetUrl(url);
+      if (!parsed) {
+        throw new Error("Invalid link. Please ensure the link contains <code>/spreadsheets/d/YOUR_SHEET_ID</code>.");
+      }
+
+      // A local file must not depend on third-party CORS bridges. Try Google's
+      // own export endpoints only; if the browser blocks them, the error below
+      // provides the direct-download fallback.
+      const proxyEndpoints = [parsed.xlsxExportUrl, parsed.csvExportUrl];
+
+      for (const endpoint of proxyEndpoints) {
+        try {
+          const res = await fetch(endpoint);
+          if (!res.ok) continue;
+
+          if (endpoint.includes('format=xlsx')) {
+            const buffer = await res.arrayBuffer();
+            const sampleText = new TextDecoder().decode(buffer.slice(0, 120)).toLowerCase();
+            if (sampleText.includes('<!doctype') || sampleText.includes('<html')) {
+              throw new Error("RESTRICTED_ACCESS");
+            }
+            const wb = await XLSX.read(new Uint8Array(buffer), { type: 'array' });
+            if (wb && wb.SheetNames.length > 0) return wb;
+          } else {
+            const text = await res.text();
+            if (text.toLowerCase().includes('<!doctype') || text.toLowerCase().includes('<html')) {
+              throw new Error("RESTRICTED_ACCESS");
+            }
+            const parsedCsv = Papa.parse(text, { header: true, skipEmptyLines: true });
+            if (parsedCsv.data && parsedCsv.data.length > 0) {
+              const ws = XLSX.utils.json_to_sheet(parsedCsv.data);
+              const wb = XLSX.utils.book_new();
+              XLSX.utils.book_append_sheet(wb, ws, "Sheet1");
+              return wb;
+            }
+          }
+        } catch (err) {
+          if (err.message === "RESTRICTED_ACCESS") {
+            throw new Error(`
+              <strong>Access Denied by Google:</strong> This sheet is set to <strong>"Restricted"</strong>.<br>
+              <div class="mt-2 space-y-1">
+                <div>👉 Click <a href="${parsed.xlsxExportUrl}" target="_blank" class="underline text-indigo-300 font-bold">Direct Download .xlsx</a> to save it, then drag it into the box above.</div>
+                <div>👉 Or in Google Sheets, change access to <strong>"Anyone with the link can view"</strong>, then click Fetch again.</div>
+              </div>
+            `);
+          }
+        }
+      }
+
+      throw new Error(`Unable to fetch spreadsheet automatically via CORS bridges. Please click <a href="${parsed.xlsxExportUrl}" target="_blank" class="underline text-indigo-300 font-bold">Direct Download .xlsx</a>, then drop the file above.`);
+    }
+
+    document.getElementById('btn-fetch-gsheet').addEventListener('click', async () => {
+      const url = document.getElementById('gsheet-url').value.trim();
+      const btn = document.getElementById('btn-fetch-gsheet');
+      btn.disabled = true;
+      btn.innerHTML = `<i data-lucide="loader" class="w-3.5 h-3.5 animate-spin"></i><span>Converting...</span>`;
+      lucide.createIcons();
+      hideAlert();
+
+      try {
+        const wb = await fetchGoogleWorkbook(url);
+        ingestWorkbookData(wb);
+        showAlert("Success", "Google Sheet successfully converted, downloaded, and loaded!", false);
+      } catch (err) {
+        showAlert("Google Sheet Ingestion Error", err.message, true);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = `<i data-lucide="zap" class="w-3.5 h-3.5"></i><span>Convert &amp; Fetch</span>`;
+        lucide.createIcons();
+      }
+    });
+
+    /* =========================================================================
+     * 3. WORKBOOK INGESTION & PER-SHEET COLUMN MATRIX
+     * ========================================================================= */
+    function ingestWorkbookData(workbook) {
+      state.workbook = workbook;
+      state.sheetsData = {};
+      state.sheetColumnMap = {};
+
+      workbook.SheetNames.forEach(name => {
+        const sheet = workbook.Sheets[name];
+        const json = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+        state.sheetsData[name] = json;
+
+        if (json.length > 0) {
+          const headers = Object.keys(json[0]);
+          state.sheetColumnMap[name] = headers[0] || null;
+        } else {
+          state.sheetColumnMap[name] = null;
+        }
+      });
+
+      state.activeSheet = workbook.SheetNames[0];
+
+      renderSheetMatrix();
+      updatePlanSummary();
+      renderSheetTabs();
+      renderPreviewTable();
+
+      document.getElementById('file-status').textContent = `Loaded: ${workbook.SheetNames.length} sheet(s)`;
+      document.getElementById('btn-export-xlsx').disabled = false;
+      document.getElementById('btn-export-csv').disabled = false;
+      hideAlert();
+    }
+
+    function renderSheetMatrix() {
+      const container = document.getElementById('sheet-matrix');
+      container.innerHTML = '';
+
+      if (!state.workbook) return;
+
+      state.workbook.SheetNames.forEach(sheetName => {
+        const rows = state.sheetsData[sheetName] || [];
+        const selectedCol = state.sheetColumnMap[sheetName];
+        const isSkipped = !selectedCol;
+        const headers = rows.length > 0 ? Object.keys(rows[0]) : [];
+
+        const card = document.createElement('div');
+        card.className = `border rounded-xl p-3.5 space-y-2 transition ${
+          isSkipped ? 'sheet-card-skipped bg-slate-950/60' : 'sheet-card-active'
+        }`;
+
+        const headerDiv = document.createElement('div');
+        headerDiv.className = "flex items-center justify-between";
+
+        const titleSpan = document.createElement('div');
+        titleSpan.className = "text-xs font-bold flex items-center gap-2 cursor-pointer";
+        titleSpan.innerHTML = `
+          <span class="${isSkipped ? 'text-slate-400' : 'text-indigo-300'} font-mono">📋 ${escapeHtml(sheetName)}</span>
+          <span class="text-[11px] font-normal text-slate-500">(${rows.length} rows)</span>
+        `;
+        titleSpan.addEventListener('click', () => {
+          state.activeSheet = sheetName;
+          renderSheetTabs();
+          renderPreviewTable();
+        });
+
+        const statusBadge = document.createElement('span');
+        statusBadge.className = `px-2 py-0.5 rounded text-[10px] font-semibold ${
+          isSkipped ? 'bg-slate-800 text-slate-400 border border-slate-700' : 'bg-indigo-950 text-indigo-300 border border-indigo-700'
+        }`;
+        statusBadge.textContent = isSkipped ? '⊘ Skipped' : `Translating: ${selectedCol}`;
+
+        headerDiv.appendChild(titleSpan);
+        headerDiv.appendChild(statusBadge);
+        card.appendChild(headerDiv);
+
+        const pillsDiv = document.createElement('div');
+        pillsDiv.className = "flex flex-wrap gap-1.5 pt-1";
+
+        if (headers.length === 0) {
+          pillsDiv.innerHTML = `<span class="text-[11px] text-slate-500 italic">Sheet is empty.</span>`;
+        } else {
+          headers.forEach(h => {
+            const isSelected = (h === selectedCol);
+            const pill = document.createElement('button');
+            pill.type = "button";
+            pill.className = `px-2.5 py-1 rounded text-[11px] font-mono transition border ${
+              isSelected
+                ? 'bg-indigo-600 text-white border-indigo-400 font-bold shadow-sm shadow-indigo-900/50'
+                : 'bg-slate-900 hover:bg-slate-800 text-slate-300 border-slate-700 hover:border-slate-500 hover:text-white'
+            }`;
+            pill.textContent = h;
+            pill.title = `Translate "${h}" for sheet "${sheetName}"`;
+            pill.addEventListener('click', () => {
+              setSheetColumn(sheetName, h);
+            });
+            pillsDiv.appendChild(pill);
+          });
+
+          const skipPill = document.createElement('button');
+          skipPill.type = "button";
+          skipPill.className = `px-2 py-1 rounded text-[11px] font-medium transition border ${
+            isSkipped
+              ? 'bg-rose-950/80 text-rose-200 border-rose-700 font-bold'
+              : 'bg-slate-900 text-slate-400 border-slate-700 hover:border-rose-500 hover:text-rose-300'
+          }`;
+          skipPill.textContent = '⊘ Skip';
+          skipPill.title = `Do not translate sheet "${sheetName}"`;
+          skipPill.addEventListener('click', () => {
+            setSheetColumn(sheetName, null);
+          });
+          pillsDiv.appendChild(skipPill);
+        }
+
+        card.appendChild(pillsDiv);
+        container.appendChild(card);
+      });
+    }
+
+    function setSheetColumn(sheetName, columnName) {
+      state.sheetColumnMap[sheetName] = columnName;
+      state.activeSheet = sheetName;
+      renderSheetMatrix();
+      updatePlanSummary();
+      renderSheetTabs();
+      renderPreviewTable();
+    }
+
+    // Quick Actions
+    document.getElementById('btn-quick-sync-same').addEventListener('click', () => {
+      if (!state.workbook) return;
+      const activeCol = state.sheetColumnMap[state.activeSheet];
+      if (!activeCol) return showAlert("Notice", "Select an active column first to sync across matching sheets.");
+
+      let syncedCount = 0;
+      state.workbook.SheetNames.forEach(sn => {
+        const rows = state.sheetsData[sn] || [];
+        if (rows.length > 0 && Object.keys(rows[0]).includes(activeCol)) {
+          state.sheetColumnMap[sn] = activeCol;
+          syncedCount++;
+        }
+      });
+      renderSheetMatrix();
+      updatePlanSummary();
+      renderPreviewTable();
+      showAlert("Synchronized", `Aligned column "${activeCol}" across ${syncedCount} sheet(s).`, false);
+    });
+
+    document.getElementById('btn-quick-first-col').addEventListener('click', () => {
+      if (!state.workbook) return;
+      state.workbook.SheetNames.forEach(sn => {
+        const rows = state.sheetsData[sn] || [];
+        if (rows.length > 0) {
+          state.sheetColumnMap[sn] = Object.keys(rows[0])[0];
+        }
+      });
+      renderSheetMatrix();
+      updatePlanSummary();
+      renderPreviewTable();
+    });
+
+    document.getElementById('btn-quick-skip-all').addEventListener('click', () => {
+      if (!state.workbook) return;
+      state.workbook.SheetNames.forEach(sn => {
+        state.sheetColumnMap[sn] = null;
+      });
+      renderSheetMatrix();
+      updatePlanSummary();
+      renderPreviewTable();
+    });
+
+    function updatePlanSummary() {
+      const planCountEl = document.getElementById('plan-active-sheet-count');
+      const planDetailsEl = document.getElementById('plan-details');
+      const activeEntries = Object.entries(state.sheetColumnMap).filter(([sheet, col]) => col && (state.sheetsData[sheet]?.length > 0));
+
+      planCountEl.textContent = `${activeEntries.length} of ${state.workbook?.SheetNames.length || 0} sheets configured`;
+
+      if (activeEntries.length === 0) {
+        planDetailsEl.innerHTML = `<span class="text-amber-400">⚠️ No columns selected! Pick at least one column badge above.</span>`;
+        return;
+      }
+
+      let html = '<div class="flex flex-wrap gap-1.5 pt-1">';
+      activeEntries.forEach(([sheet, col]) => {
+        html += `
+          <span class="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-200 text-[11px] font-mono">
+            <strong>${escapeHtml(sheet)}:</strong> <span class="text-indigo-300">${escapeHtml(col)}</span>
+          </span>
+        `;
+      });
+      html += '</div>';
+      planDetailsEl.innerHTML = html;
+    }
+
+    /* =========================================================================
+     * 4. MULTI-SHEET DEMO WORKBOOK (Printf, {{mustache}}, [tokens] & Percentages)
+     * ========================================================================= */
+    document.getElementById('btn-load-demo').addEventListener('click', () => {
+      // Sheet 1: Catalog
+      const catalog = [
+        {
+          Product_ID: "P01",
+          Description: "Save 20% on {{product_name}}! Contact %s or [USER_REF_42] for %.2f%% boost. Formula: $E = mc^2$ 🚀",
+          Category: "Hardware"
+        },
+        {
+          Product_ID: "P02",
+          Description: "Gelato parameters: Brix target is 18°, PAC = 240, POD = 160. Verify {total_solids} = %d + %.1f! 🍨",
+          Category: "Food Science"
+        }
+      ];
+
+      // Sheet 2: Marketing
+      const marketing = [
+        {
+          Campaign_ID: "M01",
+          Ad_Copy: "Welcome {{user_name}}! Enjoy 50% discount on orders over $100 with voucher [SPRING26]. Calculated ROI: $$\\text{ROI} = \\frac{R - C}{C}$$. Contact 👨‍💻 for assistance! 🎉",
+          Audience: "Global"
+        },
+        {
+          Campaign_ID: "M02",
+          Ad_Copy: "Ensure MSNF does not exceed 10.5% in base formulation. Code: <code>apply --config</code>.",
+          Audience: "Production"
+        }
+      ];
+
+      // Sheet 3: Customer FAQs
+      const faqs = [
+        {
+          FAQ_ID: "F01",
+          Question_Text: "What does %s mean in template [CONFIG_SCHEMA]? How does PAC impact freezing point?",
+          Response: "PAC is anti-freezing power; %s is replaced dynamically by your server."
+        }
+      ];
+
+      // Sheet 4: Metadata (Skipped)
+      const meta = [
+        { Setting: "App_Version", Value: "5.0-ShieldPro" },
+        { Setting: "Default_Locale", Value: "en_US" }
+      ];
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(catalog), "Catalog");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(marketing), "Marketing");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(faqs), "Customer_FAQs");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(meta), "System_Metadata");
+      
+      ingestWorkbookData(wb);
+
+      state.sheetColumnMap["Catalog"] = "Description";
+      state.sheetColumnMap["Marketing"] = "Ad_Copy";
+      state.sheetColumnMap["Customer_FAQs"] = "Question_Text";
+      state.sheetColumnMap["System_Metadata"] = null;
+
+      renderSheetMatrix();
+      updatePlanSummary();
+      renderSheetTabs();
+      renderPreviewTable();
+    });
+
+    /* =========================================================================
+     * 5. TRANSLATION SERVICE ADAPTERS
+     * ========================================================================= */
+    async function callTranslationService(maskedTexts, targetLang, provider, keys) {
+      const cleanLang = cleanLangCode(targetLang);
+
+      // Provider 1: Free Web Google Translate
+      if (provider === 'free_google') {
+        const translations = [];
+        for (const str of maskedTexts) {
+          if (!str || !str.trim()) {
+            translations.push(str);
+            continue;
+          }
+          const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(cleanLang)}&dt=t&q=${encodeURIComponent(str)}`;
+          const res = await fetch(url);
+          if (!res.ok) throw new Error(`Google Web Error (${res.status}): Rate limit or network block.`);
+          const data = await res.json();
+          const combined = data[0].map(s => s[0]).join('');
+          translations.push(combined);
+        }
+        return translations;
+      }
+
+      // Provider 2: Official Google Cloud Translation API v2
+      if (provider === 'google_cloud') {
+        if (!keys.googleKey) throw new Error("Missing Google Cloud API Key in Step 3.");
+        const url = `https://translation.googleapis.com/language/translate/v2?key=${encodeURIComponent(keys.googleKey)}`;
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ q: maskedTexts, target: cleanLang, format: 'html' })
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(`Google Cloud (${res.status}): ${err.error?.message || res.statusText}`);
+        }
+        const data = await res.json();
+        return data.data.translations.map(t => t.translatedText);
+      }
+
+      // Provider 3: Microsoft Azure Translator v3
+      if (provider === 'azure') {
+        if (!keys.azureKey) throw new Error("Missing Azure Translator Key in Step 3.");
+        const url = `https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=${encodeURIComponent(cleanLang)}&textType=html`;
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Ocp-Apim-Subscription-Key': keys.azureKey,
+            'Ocp-Apim-Subscription-Region': keys.azureRegion || 'global',
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(maskedTexts.map(t => ({ Text: t })))
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(`Azure (${res.status}): ${err.error?.message || res.statusText}`);
+        }
+        const data = await res.json();
+        return data.map(item => item.translations[0].text);
+      }
+
+      // Provider 4: Offline Simulator
+      if (provider === 'mock') {
+        await new Promise(r => setTimeout(r, 120));
+        return maskedTexts.map(t => `[${cleanLang.toUpperCase()}] ${t}`);
+      }
+
+      throw new Error(`Unknown provider: ${provider}`);
+    }
+
+    /* =========================================================================
+     * 6. TRANSLATION QUEUE ORCHESTRATOR
+     * ========================================================================= */
+    document.getElementById('btn-start').addEventListener('click', async () => {
+      if (!state.workbook) return showAlert("Input Error", "Please upload or load a workbook first.");
+
+      const activeTargets = Object.entries(state.sheetColumnMap)
+        .filter(([sheet, col]) => col && (state.sheetsData[sheet]?.length > 0));
+
+      if (activeTargets.length === 0) {
+        return showAlert("Input Error", "Please select at least one column badge in the matrix above.");
+      }
+
+      const rawLangs = document.getElementById('target-langs').value.split(',').map(s => s.trim()).filter(Boolean);
+      if (rawLangs.length === 0) return showAlert("Input Error", "Please specify at least one target language.");
+
+      const glossary = document.getElementById('protected-glossary').value.split(',').map(s => s.trim()).filter(Boolean);
+      const provider = document.getElementById('provider-select').value;
+      const keys = {
+        googleKey: document.getElementById('google-api-key').value.trim(),
+        azureKey: document.getElementById('azure-key').value.trim(),
+        azureRegion: document.getElementById('azure-region').value.trim()
+      };
+
+      state.isRunning = true;
+      state.isCancelled = false;
+      document.getElementById('btn-start').classList.add('hidden');
+      document.getElementById('btn-cancel').classList.remove('hidden');
+      document.getElementById('progress-container').classList.remove('hidden');
+      hideAlert();
+
+      let totalCells = 0;
+      activeTargets.forEach(([sn]) => totalCells += state.sheetsData[sn].length * rawLangs.length);
+      let completedCells = 0;
+
+      try {
+        for (const [sheetName, sourceCol] of activeTargets) {
+          if (state.isCancelled) break;
+          const rows = state.sheetsData[sheetName];
+
+          for (const lang of rawLangs) {
+            if (state.isCancelled) break;
+            const langCode = cleanLangCode(lang);
+            const targetColName = `${sourceCol}_${langCode.toUpperCase()}`;
+
+            const batchSize = 20;
+            for (let i = 0; i < rows.length; i += batchSize) {
+              if (state.isCancelled) break;
+
+              const slice = rows.slice(i, i + batchSize);
+              const maskRecords = slice.map(row => TokenizerEngine.mask(String(row[sourceCol] || ''), glossary));
+              const maskedStrings = maskRecords.map(r => r.maskedText);
+
+              const currentProgress = Math.round((completedCells / totalCells) * 100);
+              document.getElementById('progress-pct').textContent = `${currentProgress}%`;
+              document.getElementById('progress-bar').style.width = `${currentProgress}%`;
+              document.getElementById('progress-status').textContent = 
+                `Sheet: ${sheetName} | "${sourceCol}" → [${langCode.toUpperCase()}] | Rows ${i + 1}-${Math.min(i + batchSize, rows.length)} of ${rows.length}`;
+
+              const translatedMasks = await callTranslationService(maskedStrings, langCode, provider, keys);
+
+              translatedMasks.forEach((translatedStr, idx) => {
+                const finalStr = TokenizerEngine.unmask(translatedStr, maskRecords[idx].tokens);
+                slice[idx][targetColName] = finalStr;
+              });
+
+              completedCells += slice.length;
+              renderPreviewTable();
+            }
+          }
+        }
+
+        if (!state.isCancelled) {
+          document.getElementById('progress-pct').textContent = `100%`;
+          document.getElementById('progress-bar').style.width = `100%`;
+          document.getElementById('progress-status').textContent = `Translation complete!`;
+          showAlert("Success", "All configured sheets and columns translated successfully.", false);
+        }
+      } catch (err) {
+        showAlert("Translation Failure", err.message);
+      } finally {
+        state.isRunning = false;
+        document.getElementById('btn-start').classList.remove('hidden');
+        document.getElementById('btn-cancel').classList.add('hidden');
+      }
+    });
+
+    document.getElementById('btn-cancel').addEventListener('click', () => {
+      state.isCancelled = true;
+      document.getElementById('progress-status').textContent = "Cancelling...";
+    });
+
+    /* =========================================================================
+     * 7. PREVIEW TABLE & SHEET TABS
+     * ========================================================================= */
+    function renderSheetTabs() {
+      const container = document.getElementById('preview-sheet-tabs');
+      container.innerHTML = '';
+
+      if (!state.workbook) return;
+
+      state.workbook.SheetNames.forEach(sn => {
+        const btn = document.createElement('button');
+        const isActive = sn === state.activeSheet;
+        const col = state.sheetColumnMap[sn];
+        btn.className = `px-3 py-1.5 text-xs font-semibold rounded-lg transition ${
+          isActive ? 'bg-indigo-600 text-white shadow-sm' : 'bg-slate-900 text-slate-400 hover:bg-slate-800 border border-slate-800'
+        }`;
+        btn.innerHTML = `${escapeHtml(sn)} <span class="text-[10px] opacity-75 font-mono">(${col ? col : 'skipped'})</span>`;
+        btn.addEventListener('click', () => {
+          state.activeSheet = sn;
+          renderSheetTabs();
+          renderPreviewTable();
+        });
+        container.appendChild(btn);
+      });
+    }
+
+    function renderPreviewTable() {
+      const table = document.getElementById('preview-table');
+      const rows = state.sheetsData[state.activeSheet] || [];
+      const chosenCol = state.sheetColumnMap[state.activeSheet];
+      document.getElementById('preview-row-count').textContent = `(${rows.length} rows)`;
+
+      if (rows.length === 0) {
+        table.innerHTML = `<tbody><tr><td class="p-6 text-center text-slate-500 font-sans">Sheet is empty.</td></tr></tbody>`;
+        return;
+      }
+
+      const headers = Object.keys(rows[0]);
+      let headerHtml = '<thead class="bg-slate-900 sticky top-0 border-b border-slate-800 text-slate-300"><tr>';
+      headerHtml += '<th class="p-2.5 text-slate-500 w-12 text-center">#</th>';
+
+      headers.forEach(h => {
+        const isSource = chosenCol && (h === chosenCol);
+        const isTranslation = chosenCol && h.startsWith(`${chosenCol}_`);
+        const badgeColor = isSource ? 'text-indigo-400 font-bold' : (isTranslation ? 'text-emerald-400 font-bold' : 'text-slate-300');
+        headerHtml += `<th class="p-2.5 ${badgeColor}">${escapeHtml(h)}</th>`;
+      });
+      headerHtml += '</tr></thead>';
+
+      let bodyHtml = '<tbody class="divide-y divide-slate-800/60">';
+      rows.slice(0, 50).forEach((r, idx) => {
+        bodyHtml += `<tr class="hover:bg-slate-900/50"><td class="p-2.5 text-center text-slate-500 font-sans">${idx + 1}</td>`;
+        headers.forEach(h => {
+          bodyHtml += `<td class="p-2.5">${renderHighlightedPreview(String(r[h] ?? ''))}</td>`;
+        });
+        bodyHtml += '</tr>';
+      });
+      bodyHtml += '</tbody>';
+
+      table.innerHTML = headerHtml + bodyHtml;
+    }
+
+    function renderHighlightedPreview(text) {
+      if (!text) return '';
+      let safe = escapeHtml(text);
+      safe = safe.replace(/(&lt;\/?[a-zA-Z][^&]*&gt;)/g, '<span class="token-badge tag">$1</span>');
+      safe = safe.replace(/(\{\{[^{}\n\r\t]+?\}\}|\{[^{}\n\r\t]+?\})/g, '<span class="token-badge var">$1</span>');
+      safe = safe.replace(/(%(\d+\$)?[+-]?(?:0)?\d*(?:\.\d+)?[diufFeEgGxXoscpn])/g, '<span class="token-badge printf">$1</span>');
+      safe = safe.replace(/(\[[A-Za-z0-9_-]{2,}\]|\[\d+\])/g, '<span class="token-badge bracket">$1</span>');
+      safe = safe.replace(/(\$\$[\s\S]*?\$\$|\$[^\$\n]+?\$)/g, '<span class="token-badge math">$1</span>');
+      return safe;
+    }
+
+    /* =========================================================================
+     * 8. TOKENIZER LAB PLAYGROUND
+     * ========================================================================= */
+    function runTokenizerLab() {
+      const raw = document.getElementById('lab-input').value;
+      const glossaryText = document.getElementById('protected-glossary').value;
+      const glossaryTerms = glossaryText.split(',').map(t => t.trim()).filter(Boolean);
+
+      const { maskedText, tokens } = TokenizerEngine.mask(raw, glossaryTerms);
+
+      let highlightedMasked = escapeHtml(maskedText);
+      tokens.forEach(tok => {
+        const ph = escapeHtml(tok.placeholder);
+        highlightedMasked = highlightedMasked.split(ph).join(`<span class="token-badge ${tok.type}">${ph}</span>`);
+      });
+      document.getElementById('lab-masked-output').innerHTML = highlightedMasked;
+
+      const tokensContainer = document.getElementById('lab-tokens-table');
+      if (tokens.length === 0) {
+        tokensContainer.innerHTML = '<span class="text-xs text-slate-500 italic">No protected tokens found in input.</span>';
+      } else {
+        let tableHtml = `<table class="w-full text-left text-xs font-mono">
+          <thead class="text-slate-400 border-b border-slate-800">
+            <tr>
+              <th class="pb-1">Placeholder</th>
+              <th class="pb-1">Type</th>
+              <th class="pb-1">Original Token</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-800/40">
+        `;
+        tokens.forEach(t => {
+          tableHtml += `<tr>
+            <td class="py-1 text-indigo-400 font-bold">${t.placeholder}</td>
+            <td class="py-1"><span class="token-badge ${t.type}">${t.type}</span></td>
+            <td class="py-1 text-slate-200">${escapeHtml(t.original)}</td>
+          </tr>`;
+        });
+        tableHtml += `</tbody></table>`;
+        tokensContainer.innerHTML = tableHtml;
+      }
+
+      const restored = TokenizerEngine.unmask(maskedText, tokens);
+      document.getElementById('lab-restored-output').textContent = restored;
+    }
+
+    /* =========================================================================
+     * 9. EXPORT & DOWNLOAD HANDLERS
+     * ========================================================================= */
+    document.getElementById('btn-export-xlsx').addEventListener('click', () => {
+      if (!state.workbook) return;
+      const outWb = XLSX.utils.book_new();
+      state.workbook.SheetNames.forEach(sheetName => {
+        const updatedJson = state.sheetsData[sheetName];
+        const newWs = XLSX.utils.json_to_sheet(updatedJson);
+        XLSX.utils.book_append_sheet(outWb, newWs, sheetName);
+      });
+      XLSX.writeFile(outWb, `TransShield_MultiSheet_${Date.now()}.xlsx`);
+    });
+
+    document.getElementById('btn-export-csv').addEventListener('click', () => {
+      if (!state.workbook || !state.activeSheet) return;
+      const data = state.sheetsData[state.activeSheet];
+      const csv = Papa.unparse(data);
+      const blob = new Blob(["\uFEFF" + csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${state.activeSheet}_translated.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    /* =========================================================================
+     * 10. UI HELPERS & EVENT BINDINGS
+     * ========================================================================= */
+    function escapeHtml(text) {
+      return String(text)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+
+    function showAlert(title, messageHtml, isError = true) {
+      const banner = document.getElementById('alert-banner');
+      banner.className = `rounded-xl p-4 border flex items-start gap-3 shadow-xl ${
+        isError ? 'bg-rose-950/80 border-rose-700 text-rose-100' : 'bg-emerald-950/80 border-emerald-700 text-emerald-100'
+      }`;
+      document.getElementById('alert-icon').textContent = isError ? '❌' : '✅';
+      document.getElementById('alert-title').textContent = title;
+      document.getElementById('alert-msg').innerHTML = messageHtml;
+      banner.classList.remove('hidden');
+      banner.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    function hideAlert() {
+      document.getElementById('alert-banner').classList.add('hidden');
+    }
+
+    document.getElementById('provider-select').addEventListener('change', (e) => {
+      const val = e.target.value;
+      document.getElementById('cfg-google-cloud').classList.toggle('hidden', val !== 'google_cloud');
+      document.getElementById('cfg-azure').classList.toggle('hidden', val !== 'azure');
+    });
+
+    // File Drag-Drop & Picker
+    const dropZone = document.getElementById('drop-zone');
+    const fileInput = document.getElementById('file-input');
+    dropZone.addEventListener('click', () => fileInput.click());
+    dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('border-indigo-500'); });
+    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('border-indigo-500'));
+    dropZone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropZone.classList.remove('border-indigo-500');
+      if (e.dataTransfer.files.length) handleIncomingFile(e.dataTransfer.files[0]);
+    });
+    fileInput.addEventListener('change', (e) => {
+      if (e.target.files.length) handleIncomingFile(e.target.files[0]);
+    });
+
+    function handleIncomingFile(file) {
+      const reader = new FileReader();
+      const ext = file.name.split('.').pop().toLowerCase();
+
+      if (ext === 'xlsx') {
+        reader.onload = async (e) => {
+          try {
+            const wb = await XLSX.read(new Uint8Array(e.target.result), { type: 'array' });
+            ingestWorkbookData(wb);
+          } catch (err) {
+            showAlert("Excel Import Error", err.message);
+          }
+        };
+        reader.readAsArrayBuffer(file);
+      } else if (ext === 'xls') {
+        showAlert("Legacy .xls Not Supported", "Please save the workbook as .xlsx, CSV, or TSV first. The local build does not ship a legacy binary Excel parser.");
+      } else if (ext === 'csv' || ext === 'tsv') {
+        reader.onload = (e) => {
+          const parsed = Papa.parse(e.target.result, { header: true, skipEmptyLines: true, delimiter: ext === 'tsv' ? '\t' : undefined });
+          const ws = XLSX.utils.json_to_sheet(parsed.data);
+          const wb = XLSX.utils.book_new();
+          XLSX.utils.book_append_sheet(wb, ws, "Data");
+          ingestWorkbookData(wb);
+        };
+        reader.readAsText(file);
+      } else if (ext === 'txt') {
+        reader.onload = (e) => {
+          const rows = String(e.target.result || '').split(/\r?\n/).filter(line => line.trim() !== '').map(line => ({ Text: line }));
+          const ws = XLSX.utils.json_to_sheet(rows);
+          const wb = XLSX.utils.book_new();
+          XLSX.utils.book_append_sheet(wb, ws, "Text");
+          ingestWorkbookData(wb);
+        };
+        reader.readAsText(file);
+      } else if (ext === 'json') {
+        reader.onload = (e) => {
+          try {
+            const data = JSON.parse(e.target.result);
+            const array = Array.isArray(data) ? data : [data];
+            const ws = XLSX.utils.json_to_sheet(array);
+            const wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, ws, "JSON_Data");
+            ingestWorkbookData(wb);
+          } catch(err) {
+            showAlert("JSON Parsing Error", err.message);
+          }
+        };
+        reader.readAsText(file);
+      }
+    }
+
+    // Lab Modal Listeners
+    const labModal = document.getElementById('labModal');
+    document.getElementById('btn-open-lab').addEventListener('click', () => {
+      labModal.classList.remove('hidden');
+      labModal.classList.add('flex');
+      runTokenizerLab();
+    });
+    document.getElementById('btn-close-lab').addEventListener('click', () => {
+      labModal.classList.add('hidden');
+      labModal.classList.remove('flex');
+    });
+    document.getElementById('btn-run-lab').addEventListener('click', runTokenizerLab);
+
+    // Initial icon render
+    document.addEventListener('DOMContentLoaded', () => {
+      lucide.createIcons();
+    });
+  </script>
+</body>
+</html>
