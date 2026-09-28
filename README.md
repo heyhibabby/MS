@@ -1,2 +1,2 @@
-# MarketScope
+# MS
 Compare Prices
